@@ -1,142 +1,87 @@
-# OCI Skeleton
+# OCI OpenResty Gateway
 
-This repository serves as a skeleton and template for taking prebuilt, open-source container images and making them compliant with rootless, hardened container standards and modern Kubernetes security requirements. It also includes an accompanying **Helm chart** to simplify deployment.
+This repository builds a hardened, rootless **OpenResty OIDC Gateway** container image (`ghcr.io/joeckr/openresty`) compliant with modern rootless container standards and Kubernetes Pod Security Standards (`restricted`).
 
 ## Purpose
 
-Often, standard open-source container images run as the `root` user or require specific privileges that are not allowed by default in highly secure, restricted environments enforcing strict Kubernetes Pod Security Standards and rootless execution.
+Standard `openresty` images run as `root` by default, do not bundle OpenID Connect (OIDC) Lua modules in the minimal `alpine-slim` variant, and require permission adjustments to run under arbitrary non-root UIDs in restricted Kubernetes and rootless Podman environments.
 
-This skeleton provides a standardized approach to:
-- Modify existing open-source Dockerfiles to run as non-root users and **build cleanly in rootless environments**.
-- Adjust permissions and file ownership to comply with arbitrary UID requirements and restricted pod security standards.
-- Package the deployment configurations into a flexible, easily deployable Helm chart that supports standard Kubernetes Ingress.
-- Provide a multi-tiered testing pipeline spanning local Podman Compose, local Kubernetes manifest execution via `podman play kube`, and end-to-end deployment on a live Kubernetes cluster.
+This project provides:
+- A multi-stage build that compiles `lua-resty-openidc` (and its dependencies `lua-resty-http`, `lua-resty-session`, and `lua-resty-jwt`) in `openresty:alpine-fat` and copies only the Lua runtime libraries into `openresty:alpine-slim`.
+- Pre-configured OpenID Connect (OIDC) authentication for browser sessions and OAuth 2.0 Bearer token introspection for API clients.
+- Rootless, non-root execution (`USER 1031`, GID `0` permissions `g+rwX`) listening on unprivileged port `8080`.
+- Dynamic DNS resolver discovery and configuration templating at container startup via `entrypoint.sh`.
 
 ## Features
 
-- **Rootless Image Builds**: Engineered to build cleanly in unprivileged, rootless container builders (such as rootless Podman, Buildah, or unprivileged CI runners) without requiring host root or privileged daemon sockets.
-- **Rootless & Hardened Image Design**: Configured to run without root privileges and handle arbitrary runtime user IDs under restricted pod security standards.
-- **Hardened Kubernetes Compatibility**: Fully compliant with upstream Kubernetes Pod Security Standards (`restricted` PSS/PSA level).
-- **Standard Ingress Support**: Helm chart configures standard Kubernetes `Ingress` (`networking.k8s.io/v1`).
-- **Helm Chart Included**: Comes with a ready-to-use Helm chart (`chart/`) for templated, reproducible deployments with hardened pod security contexts.
-- **Mise Task Automation**: Built-in `mise` tasks for local compose testing, `podman play kube` simulation, linting, rendering, and cluster deployment.
-- **GitHub Actions CI**: Automated workflows to build and push images based on versions defined in `versions.json`.
-- **Example Implementation**: Includes an NGINX implementation out-of-the-box to demonstrate the necessary modifications.
+- **Dual OIDC Authentication Modes**:
+  - **Web App Flow**: Browser requests are authenticated via the OIDC Authorization Code flow (`resty.openidc.authenticate`) backed by an Nginx shared-memory session store (`lua_shared_dict sessions 10m`).
+  - **API Bearer Token Validation**: Requests containing an `Authorization: Bearer <token>` or `Accept: application/json` header validate tokens locally via JWKS signature verification (`resty.openidc.bearer_jwt_verify`), avoiding latency-heavy network round-trips to the IdP. Opaque tokens can also be validated via OAuth 2.0 token introspection (`OIDC_BEARER_VALIDATION_METHOD=introspect`). Validated tokens are exported to `$backend_auth_token`.
+  - **CORS Preflight Pass-Through**: `OPTIONS` requests immediately return `200 OK` prior to OIDC checks.
+  - **RP-Initiated Logout**: Built-in `/logout` and `/logged_out/` endpoints (`src/logout.conf`).
+- **Rootless & Hardened Image Design**: Runs without root privileges (`USER 1031`) and handles arbitrary runtime UIDs (`chgrp -R 0` and `chmod -R g+rwX`) under restricted Pod Security Standards.
+- **Minimal Alpine Footprint**: Uses a multi-stage build to keep the final image based on `openresty:<version>-alpine-slim` without shipping compiler toolchains or Luarocks build dependencies.
+- **Dynamic Resolver Configuration**: Automatically resolves the container's nameserver from `/etc/resolv.conf` (or uses `NGINX_RESOLVER`) at startup.
+- **Modular Routing**: Includes `/etc/nginx/oidc/*.conf` so static assets (`src/client.conf`) or reverse-proxy upstream routes can be mounted or extended cleanly.
 
 ## Repository Structure
 
-- `Dockerfile`: The template Dockerfile demonstrating how to adapt an image (NGINX by default) for compliance.
-- `chart/`: The accompanying Helm chart for deploying the application to Kubernetes.
-- `compose.yml`: For local testing and development of the modified image.
-- `compose.upstream.yml`: For local testing and benchmarking against the unmodified upstream image.
-- `mise.toml`: Task runner configuration automating build, compose, play, lint, and cluster deployment workflows.
-- `versions.json`: Used by CI workflows to determine which versions of the image to build.
-- `.github/workflows/`: CI/CD pipelines for building and pushing the images.
+- `Dockerfile`: Multi-stage Dockerfile building the hardened OpenResty OIDC gateway image.
+- `src/entrypoint.sh`: Startup script that detects `NGINX_RESOLVER`, renders configuration templates with `envsubst`, and launches OpenResty.
+- `src/nginx.conf`: Core OpenResty configuration defining non-root temp paths under `/tmp/nginx/*`, shared session memory (`sessions`), and environment variable passthrough.
+- `src/oidc.conf`: Server block on port `8080` implementing Lua OIDC authentication and Bearer token introspection.
+- `src/client.conf`: Default static location block (`/`) serving `/usr/share/nginx/html`.
+- `src/logout.conf`: OIDC `/logout` and `/logged_out/` location blocks.
+- `src/index.html`: Default placeholder landing page.
+- `compose.yml`: Local Podman/Docker Compose stack for building and testing the gateway image.
+- `compose.upstream.yml`: Baseline Compose configuration using the unmodified upstream OpenResty image.
+- `versions.json`: Upstream OpenResty version matrix used by CI release workflows.
+- `mise.toml`: Task runner definitions for local builds, compose workflows, linting, and Trivy security scans.
+- `.github/workflows/`: Automated CI/CD workflows for linting, security auditing, and multi-arch image releases.
+
+## Configuration & Environment Variables
+
+The gateway is configured at runtime via environment variables passed to the container:
+
+| Variable | Default | Description |
+|---|---|---|
+| `OIDC_ENABLED` | *(unset)* | Set to `"true"` to enforce OIDC authentication and Bearer introspection. When unset or not `"true"`, requests bypass OIDC checks. |
+| `OIDC_ISSUER` | *(required when enabled)* | Base OIDC issuer URL (e.g., `https://idp.example.com/realms/main`). `/.well-known/openid-configuration` is appended automatically. |
+| `OIDC_CLIENT_ID` | *(required when enabled)* | OIDC relying party client ID. |
+| `OIDC_CLIENT_SECRET` | *(required when enabled)* | OIDC relying party client secret. |
+| `OIDC_REDIRECT_URI` | *(required when enabled)* | Base application URL (e.g., `https://app.example.com`). `/redirect_uri` and `/logged_out` are appended automatically. |
+| `OIDC_SSL_VERIFY` | *(required when enabled)* | Set to `"yes"` or `"no"` to control TLS certificate verification against the OIDC discovery/token endpoints. |
+| `OIDC_SESSION_SECRET` | *(required when enabled)* | Secret string used by `lua-resty-session` to encrypt session cookies. |
+| `OIDC_COOKIE_SECURE` | `"false"` | Set to `"true"` to mark session cookies `Secure` (HTTPS-only). |
+| `OIDC_BEARER_VALIDATION_METHOD` | `"jwt"` | Method for validating Bearer tokens: `"jwt"` (local signature & claims validation via JWKS) or `"introspect"` (outbound OAuth 2.0 introspection call). |
+| `NGINX_RESOLVER` | First `nameserver` in `/etc/resolv.conf` | DNS resolver IP injected into `resolver ${NGINX_RESOLVER} valid=30s;`. |
 
 ## Security & Hardened Image Architecture
 
-Modern hardened Kubernetes environments prioritize workload security and least privilege by enforcing strict runtime constraints. This repository is architected to produce rootless, hardened container images that run out-of-the-box under restricted security standards without requiring root privileges.
+Modern hardened Kubernetes environments enforce strict runtime constraints under the **Pod Security Admission (PSA)** `restricted` profile:
 
-### Hardened Container Standards (Kubernetes PSS `restricted`)
-
-Under the Kubernetes **Pod Security Admission (PSA)** `restricted` profile and modern hardened container runtimes:
-- **Must Run As Non-Root**: The pod specification sets `securityContext.runAsNonRoot: true` with a dedicated non-root UID (`USER 1031` or dynamic non-root UID). Containers cannot execute as UID 0.
-- **Arbitrary Dynamic UIDs**: Workload environments may assign dynamic arbitrary non-root UIDs. Files and directories required at runtime are configured with group 0 permissions (`chgrp -R 0` and `chmod -R g+rwX`) so any non-root UID can execute and access required assets.
-- **Drop All Capabilities**: The container specification explicitly drops all Linux capabilities (`capabilities.drop: ["ALL"]`).
-- **Disallow Privilege Escalation**: Pods enforce `securityContext.allowPrivilegeEscalation: false` to prevent child processes from acquiring additional privileges.
-- **RuntimeDefault Seccomp**: Workloads enforce `seccompProfile: { type: RuntimeDefault }` to restrict syscalls to safe defaults.
-- **Credential Protection**: Hardened with `automountServiceAccountToken: false` to avoid leaking Kubernetes API tokens to application containers unless explicitly needed.
-- **Unprivileged Ports**: Containers listen on non-privileged ports (> 1024).
-- **Standard Ingress & Storage**: Uses standard Kubernetes `networking.k8s.io/v1` `Ingress` and standard CSI PersistentVolumeClaims.
-
-### Rootless Build Environment Compliance
-
-Building container images inside secure or unprivileged environments (such as rootless Podman/Buildah on developer workstations, or unprivileged Kubernetes CI runners like Tekton or Kaniko) requires that the build process itself does not rely on host `root` privileges or the legacy root-owned Docker daemon socket (`/var/run/docker.sock`).
-
-This repository's `Dockerfile` is engineered for complete rootless build support:
-- **No Host Root Required**: Builds execute and succeed cleanly under unprivileged user namespaces without needing `sudo` or privileged container builders.
-- **User Namespace Friendly Permissions**: Layer modifications rely on `chgrp -R 0` and group-based permissions (`g+rwX`), which map cleanly into subordinate UID/GID allocations (`/etc/subuid` and `/etc/subgid`) without failing on host-restricted `chown` operations.
-- **Atomic Copy Permissions**: Uses `COPY --chmod=755` directly rather than invoking privileged `chmod` steps in subsequent `RUN` layers.
-- **Unprivileged Local Build**: Run `mise run build` (`podman buildx build --platform linux/amd64 -t ghcr.io/joeckr/oci-modified:test . --load`) or `mise run compose` to build locally without root escalation.
+- **Must Run As Non-Root**: The image runs as `USER 1031` so it never executes as UID `0` (and avoids Nginx's root `chown()` behavior on temp directories).
+- **Arbitrary Dynamic UIDs**: Runtime configuration and temp directories (`/tmp/nginx`, `/var/run/openresty`, `/usr/local/openresty/nginx/logs`, `/usr/local/openresty/nginx/conf`, `/etc/nginx/conf.d`) are assigned to group `0` (`chgrp -R 0`) with group read/write/execute permissions (`chmod -R g+rwX`).
+- **Unprivileged Ports**: OpenResty listens on port `8080` (`> 1024`), allowing all Linux capabilities (`ALL`, including `NET_BIND_SERVICE` and `CHOWN`) to be dropped.
+- **Ephemeral PID & Temp Paths**: PID file (`/tmp/nginx.pid`) and temp directories (`/tmp/nginx/*`) reside in `/tmp` to support read-only root filesystems when `/tmp` and config directories are mounted as writable volumes.
 
 ### Compliance Matrix
 
 | Security Dimension | Restricted Standard Requirement | Implementation in This Repo |
 |---|---|---|
-| **Build Execution** | Unprivileged / rootless builder compatible | Builds unprivileged via rootless Podman/Buildah (`mise run build`) |
-| **User ID** | Non-root UID (`runAsNonRoot: true`) / dynamic UID | `USER 1031` in Dockerfile + `runAsNonRoot: true` in Helm |
-| **Group Permissions** | GID 0 (`root` group) with `g+rwX` | `chgrp -R 0` & `chmod -R g+rwX` on runtime paths |
-| **Capabilities** | Must drop `ALL` capabilities | `capabilities.drop: ["ALL"]` in Helm chart |
-| **Privilege Escalation** | Prohibited (`allowPrivilegeEscalation: false`) | Configured in Helm `securityContext` |
-| **Seccomp Profile** | `RuntimeDefault` or `Localhost` | `seccompProfile: { type: RuntimeDefault }` |
-| **Service Account Token** | Disabled unless required | `automountServiceAccountToken: false` |
-| **Port Binding** | Unprivileged (> 1024) | Listens on port `8080` |
-| **Ingress Layer** | Standard Kubernetes Ingress | Kubernetes Ingress (`networking.k8s.io/v1`) |
-| **Storage Layer** | Kubernetes CSI StorageClass | Standard PVC template with configurable `storageClass` |
----
-
-## Local Environment & Podman Setup
-
-To ensure containerized applications and Helm charts tested locally run cleanly when deployed to hardened Kubernetes environments, this repository is designed to be used alongside the Podman configuration in [joeckr/dotfiles](https://github.com/joeckr/dotfiles).
-
-The dotfiles repository provides a centralized [`containers.conf`](https://github.com/joeckr/dotfiles/blob/main/containers/containers.conf) (deployed to `~/.config/containers/containers.conf`) that configures Podman to enforce rootless and hardened container runtime restrictions in testing:
-
-| Security Rule | Podman Configuration | Description |
-|---|---|---|
-| **Random UID (`MustRunAsRange`)** | `userns = "auto"` | Allocates dynamic subordinate UID/GID ranges from `/etc/subuid` and `/etc/subgid`. Containers run unprivileged without mapping host root. |
-| **Drop Capabilities** | `default_capabilities = ["NET_BIND_SERVICE"]` | Drops standard root capabilities (`CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `SETUID`, `SETGID`, `SYS_CHROOT`, etc.) and permits only `NET_BIND_SERVICE`. |
-| **Disallow Privileged** | `privileged = false` | Disallows privileged container execution by default. |
-| **Seccomp Profile** | `seccomp_profile = "/usr/share/containers/seccomp.json"` | Enforces the runtime default seccomp profile (`RuntimeDefault`). |
-| **Namespace Isolation** | `cgroupns`, `ipcns`, `pidns`, `utsns = "private"` | Enforces private container namespaces (host namespaces are forbidden in restricted profiles). |
-
-### macOS Podman Machine Integration
-
-On macOS, the dotfiles installer script (`brew/podman.sh`) automates the machine lifecycle:
-
-1. Deploys `containers/containers.conf` to `~/.config/containers/containers.conf` on the host.
-2. Initializing `podman machine init` automatically mounts `~/.config/containers` into `/etc/containers` inside the Fedora CoreOS VM.
-3. Automatically symlinks `/etc/containers/containers.conf` to the VM user's config (`~core/.config/containers/containers.conf`) and restarts the Podman API service so all container executions immediately enforce these constraints.
+| **Build Execution** | Unprivileged / rootless builder compatible | Multi-stage build runs cleanly via rootless Podman/Buildah (`mise run build`) |
+| **User ID** | Non-root UID (`runAsNonRoot: true`) / dynamic UID | `USER 1031` in `Dockerfile` |
+| **Group Permissions** | GID `0` (`root` group) with `g+rwX` | `chgrp -R 0` & `chmod -R g+rwX` on runtime & config paths |
+| **Port Binding** | Unprivileged (`> 1024`) | Listens on port `8080` (`EXPOSE 8080`) |
 
 ---
 
-## Testing & Validation Process
+## Local Testing & Development
 
-This repository defines a 4-tier testing process to validate container security, manifest generation, and runtime compatibility from local development through to production cluster deployment.
-
-```
-┌─────────────────────────┐     ┌─────────────────────────┐     ┌─────────────────────────┐     ┌─────────────────────────┐
-│ Tier 1: Upstream Test   │ ──> │ Tier 2: Modified Test   │ ──> │ Tier 3: Podman Play     │ ──> │ Tier 4: K8s Cluster     │
-│ Surface root & cap gaps │     │ Verify non-root & fixes │     │ Validate K8s manifests  │     │ Live Helm verification  │
-│ (compose.upstream.yml)  │     │ (compose.yml)           │     │ (podman play kube)      │     │ (helm install)          │
-└─────────────────────────┘     └─────────────────────────┘     └─────────────────────────┘     └─────────────────────────┘
-```
-
-### Tier 1: Upstream Baseline Comparison (`compose.upstream.yml`)
-
-The `compose.upstream.yml` configuration runs the original, unmodified upstream container image (e.g., `nginx:1.31.5-alpine`):
+### 1. Build and Run with Podman Compose (`compose.yml`)
 
 ```sh
-# Start upstream container
-podman compose -f compose.upstream.yml up -d
-
-# Stop upstream container
-podman compose -f compose.upstream.yml down
-```
-
-**Why test upstream?**
-Running the unmodified image against your restricted Podman environment simulates deploying standard public images directly into hardened Kubernetes environments. This will typically surface common failures:
-- Processes attempting to run as `root` (UID 0) or create/access files without appropriate group permissions.
-- Inability to write to system or cache directories (such as `/var/cache/nginx`).
-- Failure to bind privileged ports (< 1024) due to dropped capabilities.
-
----
-
-### Tier 2: Modified Image Local Validation (`compose.yml`)
-
-The `compose.yml` configuration builds and runs the customized `Dockerfile` containing the adaptations required for rootless, hardened container execution:
-
-```sh
-# Build and start the modified compliant container
+# Build and start the gateway container
 mise run compose
 # or: podman compose up -d --build
 
@@ -144,204 +89,48 @@ mise run compose
 mise run logs
 # or: podman compose logs -f
 
-# Verify connectivity
+# Verify connectivity (with OIDC_ENABLED unset, returns index.html)
 curl http://localhost:8080
 
-# Stop modified stack
+# Stop the stack
 mise run down
 # or: podman compose down
 ```
 
-**What this verifies:**
-- Rootless image build and layer assembly without host root privileges.
-- Non-root user execution (`USER 1031`).
-- Root group ownership (`chgrp -R 0`) and group read/write permissions (`chmod -R g+rwX`) on runtime paths (`/tmp/nginx`, `/var/cache/nginx`, `/app`).
-- Unprivileged port binding (`8080`).
-- The `entrypoint.sh` script dynamically handling runtime configuration and templating under non-root UIDs.
+### 2. Baseline Upstream Comparison (`compose.upstream.yml`)
 
----
-
-### Tier 3: Local Kubernetes Manifest Testing (`mise run play`)
-
-Before deploying to an actual Kubernetes cluster, you can test the rendered Kubernetes manifests locally using Podman's built-in `play kube` feature.
+To compare against the unmodified upstream `openresty/openresty:1.27.1.2-alpine-fat` image:
 
 ```sh
-# Render templates and play Kubernetes manifests locally
-mise run play
-
-# Teardown the played pod and resources
-mise run play-d
+podman compose -f compose.upstream.yml up -d
+podman compose -f compose.upstream.yml down
 ```
 
-**How `mise run play` works:**
-1. Triggers the dependent task `mise run helm-t`, which executes:
-   ```sh
-   helm dependency build chart/
-   helm template test chart/ > rendered.yaml
-   ```
-2. Executes `podman play kube rendered.yaml --publish-all`, which:
-   - Reads the multi-document Kubernetes YAML (`ConfigMap`, `PersistentVolumeClaim`, `Service`, `Deployment`, `Ingress`).
-   - Creates a local Podman pod matching the Kubernetes `Deployment` specification.
-   - Applies the pod's `securityContext` (`runAsNonRoot: true`, capabilities drop, seccomp profile).
-   - Mounts the `ConfigMap` (`template.txt`) and volume into the container at the specified paths.
-   - Exposes container port `8080`.
-
-**Inspecting the local play deployment:**
-```sh
-# View running pods created by play kube
-podman pod ps
-
-# View container status within the pod
-podman ps --filter "pod=oci-modified"
-
-# Verify the service responds
-curl http://localhost:8080
-
-# Check container logs within the pod
-podman logs -f oci-modified-pod-oci-modified
-```
-
-**Teardown:**
-```sh
-mise run play-d
-# or: podman play kube rendered.yaml --down
-```
-
----
-
-### Tier 4: Cluster Deployment & Testing on Kubernetes (`mise run helm-i`)
-
-The final phase validates the workload on a live Kubernetes cluster. This tests real-world Pod Security Admission (PSA) enforcement, CSI storage provisioning, network policies, and Ingress routing.
-
-#### 1. Cluster Prerequisites & Configuration
-
-Ensure your `kubectl` context points to your Kubernetes cluster:
-```sh
-kubectl config current-context
-```
-
-Ensure the container image is accessible to your cluster nodes (e.g., built and pushed to GitHub Container Registry `ghcr.io` or your local registry):
-```sh
-# Build image locally with target tag
-mise run build
-```
-
-Configure `chart/values.yaml`:
-- **Ingress**: Configure standard Kubernetes `networking.k8s.io/v1` `Ingress`:
-  ```yaml
-  ingress:
-    enabled: true
-    name: template-ingress
-    host: "test.yourdomain.com"
-    className: "nginx"             # e.g., "nginx", "traefik", or "cilium"
-    path: /
-    pathType: "Prefix"
-  ```
-- **StorageClass**: If your cluster uses a specific CSI storage provisioner (e.g., `local-path`, `mayastor`, `ceph-block`), configure `pvc.storageClass` in `values.yaml` or leave it empty `""` to use the cluster's default StorageClass.
-- **Security Context & fsGroup**: Under `app.podSecurityContext`, `fsGroup: 1031` ensures mounted volumes are writable by the non-root container user in hardened Kubernetes environments.
-
-#### 2. Linting & Template Validation
+### 3. Linting & Security Scanning
 
 ```sh
-# Lint the chart for syntax and formatting errors
-mise run helm-l
+# Run pre-commit and linter checks (hadolint, shellcheck, actionlint, zizmor, etc.)
+mise run hk
 
-# Inspect the rendered manifests before installation
-mise run helm-t
-cat rendered.yaml
-```
-
-#### 3. Deploying to the Cluster
-
-Install the Helm chart release:
-```sh
-mise run helm-i
-# or: helm install test chart/
-```
-
-#### 4. Verifying PSS Compliance & Health
-
-Check the pod status and verify that Kubernetes Pod Security Admission (PSA) allowed the pod to run:
-
-```sh
-# Check pod deployment status
-kubectl get pods -l app=oci-modified
-
-# Inspect pod details and events for security policy rejections
-kubectl describe pod -l app=oci-modified
-```
-
-> [!TIP]
-> If your namespace enforces the `restricted` Pod Security Standard and there are non-compliant settings (such as missing `runAsNonRoot` or un-dropped capabilities), `kubectl describe pod` will show warning events from the `pod-security` admission controller.
-
-Check the application logs:
-```sh
-kubectl logs -l app=oci-modified -f
-```
-
-Verify that the `ConfigMap` file and persistent storage mounted properly inside the pod:
-```sh
-kubectl exec -it deployment/oci-modified -- cat /app/template.txt
-kubectl exec -it deployment/oci-modified -- ls -la /tmp/data
-```
-
-Verify network access via port-forwarding:
-```sh
-kubectl port-forward svc/template-service 8080:8080
-# In another terminal:
-curl http://localhost:8080
-```
-
-#### 5. Uninstalling from the Cluster
-
-When testing is complete, clean up the release:
-```sh
-mise run helm-u
-# or: helm uninstall test
+# Build local test image and scan with Trivy
+mise run trivy-fs
+mise run trivy-i
 ```
 
 ---
 
 ## Mise Tasks Quick Reference
 
-All testing, linting, and lifecycle operations are conveniently accessible through `mise`:
-
 | Task | Description | Command |
 |---|---|---|
 | `install` | Install Git hooks (`pre-commit` and `commit-msg`). | `hk install --mise` |
 | `hk` (or `check`) | Run all repository pre-commit and formatting checks. | `hk check --all` |
-| `compose` | Build and run the modified image in Podman Compose. | `podman compose up -d --build` |
-| `down` | Stop and remove the modified Podman Compose stack. | `podman compose down` |
+| `build` | Build local test container image for `linux/amd64`. | `podman buildx build --platform linux/amd64 -t ghcr.io/joeckr/openresty:test . --load` |
+| `compose` | Build and run the gateway image in Podman Compose. | `podman compose up -d --build` |
+| `down` | Stop and remove the Podman Compose stack. | `podman compose down` |
 | `logs` | Follow logs from the Podman Compose stack. | `podman compose logs -f` |
-| `play` | Render chart and run manifests locally via Podman Play Kube. | `podman play kube rendered.yaml --publish-all` |
-| `play-d` | Teardown the Podman Play Kube deployment. | `podman play kube rendered.yaml --down` |
-| `helm-d` | Update and build Helm chart dependencies. | `helm dependency build chart/` |
-| `helm-l` | Lint the Helm chart for errors. | `helm lint chart/` |
-| `helm-t` | Render Helm templates to `rendered.yaml`. | `helm template test chart/ > rendered.yaml` |
-| `helm-i` | Install the Helm chart to the current Kubernetes cluster. | `helm install test chart/` |
-| `helm-u` | Uninstall the Helm chart release from the cluster. | `helm uninstall test` |
-| `build` | Build local test container image for `linux/amd64`. | `podman buildx build --platform linux/amd64 -t ghcr.io/joeckr/oci-modified:test . --load` |
 | `trivy-fs` | Scan repository filesystem for security vulnerabilities. | `trivy fs .` |
-| `trivy-i` | Scan the built container image with Trivy. | `trivy image ghcr.io/joeckr/oci-modified:test` |
-
----
-
-## Getting Started
-
-1. **Use as a Template**
-   Clone or use this repository as a template for your own project.
-
-2. **Modify the Dockerfile**
-   Update the `Dockerfile` to base it on your desired open-source image. Ensure that you maintain the non-root user configurations and adjust permissions for any directories your application needs to write to (e.g., using `chgrp -R 0` and `chmod -R g+rwX`).
-
-3. **Update the Helm Chart**
-   Navigate to the `chart/` directory and update `Chart.yaml`, `values.yaml`, and the templates to reflect your application's specifics. Configure standard Kubernetes Ingress in `values.yaml`.
-
-4. **Configure Build Versions**
-   Update `versions.json` with the upstream image versions you wish to build.
-
-5. **Run the Test Suite**
-   Validate changes through the 4-tier process: upstream compose (baseline failure), `mise run compose` (fixed local), `mise run play` (manifest test), and `mise run helm-i` (Kubernetes cluster test).
+| `trivy-i` | Scan the built container image with Trivy. | `trivy image ghcr.io/joeckr/openresty:test` |
 
 ## Support
 
@@ -351,4 +140,4 @@ If you find this project useful, consider supporting my work on [Ko-fi](https://
 
 ## License
 
-Please refer to the `LICENSE` file for details.
+Licensed under the Apache License, Version 2.0. Please refer to the [LICENSE](LICENSE) file for details.
