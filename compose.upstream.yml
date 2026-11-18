@@ -1,15 +1,8 @@
 services:
   template:
     container_name: template
-    image: nginx:1.31.5-alpine
+    image: openresty/openresty:1.27.1.2-alpine-fat
     environment:
       - ENV=dev
     ports:
       - "8080:8080"
-    volumes:
-      - template-data:/app/template-data
-      - ./template.txt:/app/template.txt
-
-volumes:
-  template-data:
-    driver: local

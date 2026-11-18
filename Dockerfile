@@ -1,23 +1,44 @@
-ARG VERSION=1.31.5
-ARG REGISTRY=docker.io/library
-FROM $REGISTRY/nginx:$VERSION-alpine
+ARG VERSION=1.27.1.2
+ARG REGISTRY=docker.io/openresty
+FROM $REGISTRY/openresty:$VERSION-alpine-fat AS fat
 
-COPY --chmod=755 entrypoint.sh /entrypoint.sh
-COPY nginx.conf /etc/nginx/nginx.conf
-COPY default.conf /etc/nginx/conf.d/default.conf
+RUN luarocks install lua-resty-openidc
 
-RUN mkdir -p /tmp/nginx/logs /tmp/nginx/client /tmp/nginx/fastcgi /tmp/nginx/proxy /tmp/nginx/scgi /tmp/nginx/uwsgi && \
-    chgrp -R 0 /tmp/nginx /var/cache/nginx && \
-    chmod -R g+rwX /tmp/nginx /var/cache/nginx
+FROM $REGISTRY/openresty:$VERSION-alpine-slim
 
-WORKDIR /app
+# hadolint ignore=DL3018
+RUN apk update && \
+    apk upgrade && \
+    apk add --no-cache ca-certificates gettext bash
 
-RUN chgrp -R 0 /app && \
-    chmod -R g+rwX /app
+COPY --from=fat /usr/local/openresty/luajit/lib/lua/5.1 /usr/local/openresty/luajit/lib/lua/5.1
+COPY --from=fat /usr/local/openresty/luajit/share/lua/5.1 /usr/local/openresty/luajit/share/lua/5.1
+
+RUN chmod -R a+rX /usr/local/openresty/lualib /usr/local/openresty/nginx/modules
+
+RUN mkdir -p /tmp/nginx/logs \
+             /tmp/nginx/client \
+             /tmp/nginx/fastcgi \
+             /tmp/nginx/proxy \
+             /tmp/nginx/uwsgi \
+             /tmp/nginx/scgi \
+             /etc/nginx/oidc && \
+    rm -f /etc/nginx/conf.d/default.conf
+
+COPY ./src/nginx.conf /usr/local/openresty/nginx/conf/nginx.conf.template
+COPY ./src/oidc.conf /etc/nginx/conf.d/oidc.conf.template
+COPY ./src/client.conf /etc/nginx/oidc
+COPY ./src/logout.conf /etc/nginx/oidc
+
+RUN chgrp -R 0 /tmp/nginx /var/run/openresty /usr/local/openresty/nginx/logs /usr/local/openresty/nginx/conf /etc/nginx/conf.d /etc/nginx/oidc && \
+    chmod -R g+rwX /tmp/nginx /var/run/openresty /usr/local/openresty/nginx/logs /usr/local/openresty/nginx/conf /etc/nginx/conf.d /etc/nginx/oidc
+
+COPY ./src/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+COPY ./src/index.html /usr/share/nginx/html/index.html
+RUN chmod -R a+r /usr/share/nginx/html
 
 EXPOSE 8080
-
-ENTRYPOINT [ "/entrypoint.sh" ]
-CMD [ "nginx", "-g", "daemon off;" ]
-
+ENTRYPOINT ["/entrypoint.sh"]
 USER 1031
