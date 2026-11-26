@@ -35,7 +35,6 @@ This project provides:
 - `src/index.html`: Default placeholder landing page.
 - `compose.yml`: Local Podman/Docker Compose stack for building and testing the gateway image.
 - `compose.upstream.yml`: Baseline Compose configuration using the unmodified upstream OpenResty image.
-- `versions.json`: Upstream OpenResty version matrix used by CI release workflows.
 - `mise.toml`: Task runner definitions for local builds, compose workflows, linting, and Trivy security scans.
 - `.github/workflows/`: Automated CI/CD workflows for linting, security auditing, and multi-arch image releases.
 
