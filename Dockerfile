@@ -1,10 +1,8 @@
-ARG VERSION=1.27.1.2
-ARG REGISTRY=docker.io/openresty
-FROM $REGISTRY/openresty:$VERSION-alpine-fat AS fat
+FROM docker.io/openresty/openresty:1.27.1.2-alpine-fat AS fat
 
 RUN luarocks install lua-resty-openidc
 
-FROM $REGISTRY/openresty:$VERSION-alpine-slim
+FROM docker.io/openresty/openresty:1.27.1.2-alpine-slim
 
 # hadolint ignore=DL3018
 RUN apk update && \
