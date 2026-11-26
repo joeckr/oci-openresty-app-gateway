@@ -28,6 +28,11 @@ steps {
     check = "addlicense -check -c 'Joseph Christopher King' -l apache {{files}}"
     fix = "addlicense -c 'Joseph Christopher King' -l apache -v {{files}}"
   }
+
+  ["helm-lint"] {
+    glob = Regex(#"^.*(Chart\.yaml|values\.yaml|templates/.*\\.yaml)$"#)
+    check = "helm lint chart/"
+  }
 }
 
 hooks {
